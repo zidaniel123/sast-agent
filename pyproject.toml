@@ -1,0 +1,42 @@
+[project]
+name = "sast-agent"
+version = "0.1.0"
+description = "Autonomous SAST agent: recon -> analyst -> reporter on the Claude Agent SDK"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "claude-agent-sdk>=0.1.0",
+    "loguru>=0.7.0",
+    "python-dotenv>=1.0.0",
+]
+
+# Version ranges here express intent; uv.lock pins the exact resolved versions
+# and their artifact hashes. Install with `uv sync --locked` so the lockfile is
+# enforced rather than silently re-resolved.
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.6",
+]
+
+[tool.uv]
+# This is an application, not a library: install the dependencies, do not build
+# and install the project itself. Run it with `uv run python main.py`.
+package = false
+
+[tool.ruff]
+line-length = 110
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.ruff.lint.per-file-ignores]
+# Long single-line kickoff strings and signatures; folding them hurts reading.
+"main.py" = ["E501"]
+
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+# Flat layout: main.py / config.py / skills.py live at the repo root.
+pythonpath = ["."]

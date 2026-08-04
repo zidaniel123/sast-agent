@@ -36,6 +36,18 @@ def _claude_code_base_url(base_url: str | None) -> str:
 # --------------------------------------------------------------------------- #
 # MCP servers (defined ONCE, shared by every phase)
 # --------------------------------------------------------------------------- #
+def _pinned(repo_url: str, ref_env_var: str) -> str:
+    """Return ``git+<url>`` with an optional ``@<ref>`` pin from the environment.
+
+    Both MCP servers are fetched and executed on the host by ``uvx``. Unpinned,
+    that means running whatever is on the default branch at the moment of the
+    run. Set the matching env var to a tag or commit SHA to freeze it — the same
+    argument as committing a lockfile, applied to the tool servers.
+    """
+    ref = os.getenv(ref_env_var, "").strip()
+    return f"git+{repo_url}@{ref}" if ref else f"git+{repo_url}"
+
+
 def mcp_servers() -> dict[str, dict]:
     """Return the ast-grep + xray MCP server definitions.
 
@@ -47,39 +59,59 @@ def mcp_servers() -> dict[str, dict]:
             "command": "uvx",
             "args": [
                 "--from",
-                "git+https://github.com/ast-grep/ast-grep-mcp",
+                _pinned("https://github.com/ast-grep/ast-grep-mcp", "AST_GREP_MCP_REF"),
                 "ast-grep-server",
             ],
-            "client_session_timeout_seconds": 300,
         },
         "xray": {
             "command": "uvx",
             "args": [
                 "--from",
-                "git+https://github.com/srijanshukla18/xray",
+                _pinned("https://github.com/srijanshukla18/xray", "XRAY_MCP_REF"),
                 "xray-mcp",
             ],
-            "client_session_timeout_seconds": 300,
         },
     }
 
 
+def assert_mcp_tools_allowed(
+    servers: dict[str, dict],
+    approved: tuple[str, ...],
+) -> None:
+    """Fail fast if a configured MCP server has no matching allowlist entry.
+
+    The SDK auto-approves only the tool names in ``allowed_tools``, and MCP tools
+    are namespaced ``mcp__<server>__<tool>``. A server that is wired up but not
+    allow-listed starts fine and then fails on every call, so the analysis
+    silently degrades to plain file reading. This turns that into a startup error.
+    """
+    missing = [name for name in servers if f"mcp__{name}" not in approved]
+    if missing:
+        raise SystemExit(
+            "MCP servers configured but not in APPROVED_TOOLS: "
+            + ", ".join(sorted(missing))
+            + ". Add the matching 'mcp__<server>' entries to config.APPROVED_TOOLS."
+        )
+
+
 # Tools each specialist agent is permitted to use.
+#
+# This list is the trust boundary. The agent reads untrusted source code, so a
+# prompt-injection payload in a scanned file is reaching a tool-using model —
+# everything granted here is something an attacker-controlled comment can try to
+# invoke. Read-only local inspection plus the two analysis servers is enough to
+# do static analysis; Bash, WebFetch, and WebSearch are deliberately absent so a
+# scan cannot execute code or reach the network.
+#
+# MCP tools are addressed as ``mcp__<server>__<tool>``. Listing the bare
+# ``mcp__<server>`` prefix auto-approves every tool that server exposes.
 APPROVED_TOOLS: tuple[str, ...] = (
     "Read",
     "Grep",
-    "Bash",
-    "KillShell",
-    "BashOutput",
-    "Fetch",
-    "WebSearch",
-    "ExitPlanMode",
-    "SlashCommand",
-    "WebFetch",
-    "Task",
     "Glob",
     "TodoWrite",
-    "Skill",
+    "mcp__ast-grep",
+    "mcp__xray",
 )
 
 
@@ -99,7 +131,7 @@ class Settings:
     approved_tools: tuple[str, ...] = APPROVED_TOOLS
 
     @classmethod
-    def from_env(cls, model: str | None = None) -> "Settings":
+    def from_env(cls, model: str | None = None) -> Settings:
         """Build settings from the environment.
 
         Accepts ``REQUESTY_API_KEY``, ``OPENAI_API_KEY`` or ``ANTHROPIC_API_KEY``

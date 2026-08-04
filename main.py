@@ -16,8 +16,10 @@ import argparse
 import asyncio
 import json
 import os
+import re
 import uuid
-from datetime import datetime, timezone
+from collections.abc import Iterator
+from datetime import UTC, datetime
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -27,8 +29,18 @@ from claude_agent_sdk import (
 )
 from loguru import logger
 
-from config import Settings, mcp_servers
-from skills import load_skill
+from config import Settings, assert_mcp_tools_allowed, mcp_servers
+from fingerprint import deduplicate
+from skills import load_skill, reference_appendix, specialist
+
+try:  # Present on current SDKs; absent on older ones.
+    from claude_agent_sdk import ResultMessage
+except ImportError:  # pragma: no cover - depends on the installed SDK
+    ResultMessage = None
+
+
+class PhaseError(RuntimeError):
+    """A pipeline phase ended without usable output."""
 
 
 def _render(template: str, **values: str) -> str:
@@ -43,15 +55,48 @@ def _render(template: str, **values: str) -> str:
     return rendered
 
 
+def _phase_prompt(agent: str, **values: str) -> str:
+    """Render one phase's system prompt: skill body + the references it cites."""
+    spec = specialist(agent)
+    return _render(
+        load_skill(spec.skill_path),
+        references=reference_appendix(spec.references),
+        **values,
+    )
+
+
+# Defense in depth. `allowed_tools` is already an allowlist, so these are
+# redundant by construction — they exist so that a future edit widening the
+# allowlist cannot silently hand a code-execution or network primitive to an
+# agent whose whole job is reading untrusted source.
+DENIED_TOOLS: tuple[str, ...] = (
+    "Bash",
+    "BashOutput",
+    "KillShell",
+    "Edit",
+    "Write",
+    "NotebookEdit",
+    "WebFetch",
+    "WebSearch",
+    "Task",
+    "SlashCommand",
+)
+
+
 def _agent_options(settings: Settings, system_prompt: str, code_path: str, max_turns: int) -> ClaudeAgentOptions:
     return ClaudeAgentOptions(
         env=settings.agent_env(),
         max_turns=max_turns,
         allowed_tools=list(settings.approved_tools),
+        disallowed_tools=list(DENIED_TOOLS),
         permission_mode="default",
         system_prompt=system_prompt,
         cwd=code_path,
         mcp_servers=mcp_servers(),
+        # Use only the servers defined above, and none of the operator's local
+        # Claude Code settings: a scan should behave identically on every host.
+        strict_mcp_config=True,
+        setting_sources=[],
     )
 
 
@@ -74,6 +119,7 @@ async def _run_phase(
     options = _agent_options(settings, system_prompt, code_path, max_turns)
 
     collected = ""
+    result = None
     async with ClaudeSDKClient(options) as client:
         await client.query(_kickoff_message())
         async for message in client.receive_response():
@@ -82,12 +128,42 @@ async def _run_phase(
                     if isinstance(block, TextBlock):
                         collected += block.text + "\n"
                         logger.info(f"{label}: {block.text}")
+            elif ResultMessage is not None and isinstance(message, ResultMessage):
+                result = message
+
+    # The terminating ResultMessage is the only place the SDK reports that a
+    # phase hit its turn budget or died on an API error. Without this check a
+    # truncated or failed phase feeds partial text into the next one and the
+    # pipeline still emits a clean-looking report.
+    if result is not None:
+        # A denied tool is how "the MCP servers are wired up but unusable"
+        # manifests, so make it loud rather than letting the phase quietly
+        # degrade to plain file reading.
+        for denial in getattr(result, "permission_denials", None) or []:
+            logger.warning(f"{label}: tool call denied: {denial}")
+
+        api_error = getattr(result, "api_error_status", None)
+        subtype = getattr(result, "subtype", None)
+        if getattr(result, "is_error", False) or api_error:
+            raise PhaseError(
+                f"{label} failed (subtype={subtype}, api_error={api_error}): "
+                f"{getattr(result, 'errors', None)}"
+            )
+        terminal = str(getattr(result, "terminal_reason", "") or "")
+        if "max_turns" in str(subtype or "") or "max_turns" in terminal:
+            raise PhaseError(
+                f"{label} exhausted its {max_turns}-turn budget before finishing. "
+                f"Raise the matching *_MAX_TURNS setting and re-run."
+            )
+
+    if not collected.strip():
+        raise PhaseError(f"{label} produced no output.")
     return collected
 
 
 async def recon_activity(settings: Settings, code_path: str) -> str:
     """Reconnaissance agent: map the attack surface."""
-    system_prompt = _render(load_skill("recon/SKILL.md"), code_path=code_path)
+    system_prompt = _phase_prompt("recon", code_path=code_path)
     return await _run_phase(
         "RECON",
         settings,
@@ -100,8 +176,8 @@ async def recon_activity(settings: Settings, code_path: str) -> str:
 
 async def analyst_activity(settings: Settings, code_path: str, recon_context: str) -> str:
     """Security analyst: deep vulnerability + taint analysis."""
-    system_prompt = _render(
-        load_skill("analyst/SKILL.md"),
+    system_prompt = _phase_prompt(
+        "analyst",
         code_path=code_path,
         recon_context=recon_context,
     )
@@ -117,11 +193,11 @@ async def analyst_activity(settings: Settings, code_path: str, recon_context: st
 
 async def reporter_activity(settings: Settings, code_path: str, analysis_results: str) -> str:
     """Reporter: emit the structured JSON findings report."""
-    system_prompt = _render(
-        load_skill("reporter/SKILL.md"),
+    system_prompt = _phase_prompt(
+        "reporter",
         code_path=code_path,
         analysis_results=analysis_results,
-        report_timestamp=datetime.now(timezone.utc).isoformat(),
+        report_timestamp=datetime.now(UTC).isoformat(),
     )
     return await _run_phase(
         "REPORTER",
@@ -133,19 +209,83 @@ async def reporter_activity(settings: Settings, code_path: str, analysis_results
     )
 
 
+_FENCED_JSON = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
+
+
+def _iter_json_candidates(text: str) -> Iterator[str]:
+    """Yield plausible JSON objects from model output, best candidate first.
+
+    Fenced blocks come first because that is what the skill asks for. The
+    fallback walks brace depth from each top-level ``{`` so that prose containing
+    a stray brace, or an illustrative snippet printed before the real report,
+    does not swallow the document the way a naive first-``{``/last-``}`` slice
+    does.
+    """
+    for match in _FENCED_JSON.finditer(text):
+        yield match.group(1)
+
+    depth = 0
+    start = -1
+    in_string = False
+    escaped = False
+    for index, char in enumerate(text):
+        if in_string:
+            if escaped:
+                escaped = False
+            elif char == "\\":
+                escaped = True
+            elif char == '"':
+                in_string = False
+            continue
+        if char == '"':
+            in_string = True
+        elif char == "{":
+            if depth == 0:
+                start = index
+            depth += 1
+        elif char == "}":
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and start != -1:
+                    yield text[start : index + 1]
+
+
 def save_report_from_text(report_text: str, output_dir: str, run_id: str) -> str | None:
     """Extract the JSON object from reporter output and write ``{run_id}.json``."""
-    start = report_text.find("{")
-    end = report_text.rfind("}")
-    if start == -1 or end == -1 or end < start:
-        logger.warning("No JSON report found in reporter output")
+    report_data = None
+    for candidate in _iter_json_candidates(report_text):
+        try:
+            parsed = json.loads(candidate)
+        except json.JSONDecodeError:
+            continue
+        # The report is an object with findings; skip illustrative fragments.
+        if isinstance(parsed, dict) and "findings" in parsed:
+            report_data = parsed
+            break
+        if isinstance(parsed, dict) and report_data is None:
+            report_data = parsed
+
+    if report_data is None:
+        os.makedirs(output_dir, exist_ok=True)
+        raw_path = os.path.join(output_dir, f"{run_id}.raw.txt")
+        with open(raw_path, "w", encoding="utf-8") as raw_file:
+            raw_file.write(report_text)
+        logger.error(
+            f"No parseable JSON report in reporter output. "
+            f"Raw output preserved at {raw_path} so the run is not lost."
+        )
         return None
 
-    try:
-        report_data = json.loads(report_text[start : end + 1])
-    except json.JSONDecodeError as exc:
-        logger.error(f"Failed to parse report JSON: {exc}")
-        return None
+    # Deduplication happens here, in code, after the model is done. The model
+    # decides what it found; this assigns each finding a fingerprint that is
+    # stable across runs and merges anything that collides.
+    raw_findings = report_data.get("findings")
+    if isinstance(raw_findings, list):
+        deduped = deduplicate(raw_findings)
+        collapsed = len(raw_findings) - len(deduped)
+        if collapsed:
+            logger.info(f"Deduplicated {len(raw_findings)} findings into {len(deduped)}")
+        report_data["findings"] = deduped
 
     os.makedirs(output_dir, exist_ok=True)
     report_path = os.path.join(output_dir, f"{run_id}.json")
@@ -191,7 +331,7 @@ def _print_summary(report_path: str | None, run_id: str) -> None:
         return
 
     try:
-        with open(report_path, "r", encoding="utf-8") as handle:
+        with open(report_path, encoding="utf-8") as handle:
             report = json.load(handle)
     except (OSError, json.JSONDecodeError):
         print(f"  Report saved to: {report_path}")
@@ -224,6 +364,9 @@ def _parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+_SAFE_RUN_ID = re.compile(r"^[A-Za-z0-9_.-]{1,64}$")
+
+
 def main() -> None:
     args = _parse_args()
 
@@ -231,15 +374,35 @@ def main() -> None:
     if not os.path.isdir(code_path):
         raise SystemExit(f"--path is not a directory: {code_path}")
 
-    output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     run_id = args.run_id or str(uuid.uuid4())
+    # The run id becomes a filename, so keep it to characters that cannot walk
+    # out of the output directory.
+    if not _SAFE_RUN_ID.match(run_id):
+        raise SystemExit(
+            "--run-id must be 1-64 characters of letters, digits, '.', '_' or '-'"
+        )
+
+    output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     settings = Settings.from_env(model=args.model)
+    if not settings.api_key:
+        raise SystemExit(
+            "No API key found. Set REQUESTY_API_KEY, OPENAI_API_KEY, or "
+            "ANTHROPIC_API_KEY in your environment or .env file."
+        )
+    assert_mcp_tools_allowed(mcp_servers(), settings.approved_tools)
 
     logger.info(f"Run id: {run_id}")
     logger.info(f"Codebase: {code_path}")
 
-    report_path = asyncio.run(run_sast_analysis(code_path, output_dir, run_id, settings))
+    try:
+        report_path = asyncio.run(run_sast_analysis(code_path, output_dir, run_id, settings))
+    except PhaseError as exc:
+        raise SystemExit(f"Analysis aborted: {exc}") from exc
+
     _print_summary(report_path, run_id)
+    if report_path is None:
+        # Exit non-zero so CI and wrappers can tell an empty run from a clean one.
+        raise SystemExit(1)
 
 
 if __name__ == "__main__":
