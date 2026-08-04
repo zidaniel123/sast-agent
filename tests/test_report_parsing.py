@@ -67,6 +67,42 @@ class TestExtraction:
         assert path is not None
         assert json.loads(open(path).read())["findings"]
 
+    def test_raw_control_characters_in_string_values_are_tolerated(self, tmp_path):
+        # Models emit multi-line evidence snippets as literal newlines/tabs inside
+        # string values, which is invalid strict JSON. Rejecting it discarded a
+        # whole run; the scanner parses it with strict=False instead.
+        text = '{"findings": [{"vulnerability": "x", "taint_flow": "line1\nline2\tcol"}]}'
+        path = _write(tmp_path, text)
+        assert path is not None
+        assert json.loads(open(path).read())["findings"][0]["vulnerability"] == "x"
+
+    def test_nested_code_fences_inside_strings_do_not_truncate(self, tmp_path):
+        # A taint_flow value containing an embedded ```python block used to make
+        # the fence regex stop at the first closing ``` — mid-string — producing
+        # a truncated, unparseable fragment.
+        text = (
+            "Emitting the final report.\n\n```json\n"
+            '{"findings": [{"vulnerability": "path bypass",'
+            ' "taint_flow": "PoC:\n```python\nrequests.get(url)\n```\ndone"}]}\n'
+            "```\n"
+        )
+        path = _write(tmp_path, text)
+        assert path is not None
+        assert json.loads(open(path).read())["findings"][0]["vulnerability"] == "path bypass"
+
+    def test_last_full_report_wins_when_reporter_re_emits(self, tmp_path):
+        # The reporter sometimes starts a report, abandons it mid-object, narrates
+        # "emitting the final report", then prints the complete one. The last
+        # object carrying a findings list must win over the abandoned first.
+        partial = '```json\n{"report_metadata": {"v": 1}, "findings": [{"vulnerability": "PARTIAL"'
+        prose = "\nAll findings verified against source. Emitting the final report.\n"
+        final = "```json\n" + json.dumps(
+            {"report_metadata": {"v": 1}, "findings": [{"vulnerability": "FINAL", "severity": "high"}]}
+        ) + "\n```\n"
+        path = _write(tmp_path, partial + prose + final)
+        assert path is not None
+        assert json.loads(open(path).read())["findings"][0]["vulnerability"] == "FINAL"
+
 
 class TestFailureIsRecoverable:
     def test_unparseable_output_preserves_the_raw_text(self, tmp_path):

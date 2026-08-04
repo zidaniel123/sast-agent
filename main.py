@@ -20,6 +20,7 @@ import re
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime
+from typing import Any
 
 from claude_agent_sdk import (
     AssistantMessage,
@@ -209,61 +210,53 @@ async def reporter_activity(settings: Settings, code_path: str, analysis_results
     )
 
 
-_FENCED_JSON = re.compile(r"```(?:json)?\s*\n(.*?)\n```", re.DOTALL)
+def _iter_json_objects(text: str) -> Iterator[Any]:
+    """Yield every top-level JSON value in ``text``, in order of appearance.
 
+    ``raw_decode`` is attempted from each ``{``, so prose between objects,
+    Markdown code fences, and even code fences *nested inside* string values
+    (evidence snippets routinely contain ```` ```python ```` blocks) are simply
+    skipped rather than truncating the scan the way matching on the first closing
+    fence does. ``strict=False`` accepts raw newlines and tabs inside string
+    values — models emit multi-line snippets that way, and rejecting them threw
+    away an entire three-phase run over an unescaped control character.
 
-def _iter_json_candidates(text: str) -> Iterator[str]:
-    """Yield plausible JSON objects from model output, best candidate first.
-
-    Fenced blocks come first because that is what the skill asks for. The
-    fallback walks brace depth from each top-level ``{`` so that prose containing
-    a stray brace, or an illustrative snippet printed before the real report,
-    does not swallow the document the way a naive first-``{``/last-``}`` slice
-    does.
+    An object that fails to decode (e.g. a report the model started, abandoned
+    mid-way, then re-emitted in full below) is stepped over one character at a
+    time, so a later, complete object is still found.
     """
-    for match in _FENCED_JSON.finditer(text):
-        yield match.group(1)
-
-    depth = 0
-    start = -1
-    in_string = False
-    escaped = False
-    for index, char in enumerate(text):
-        if in_string:
-            if escaped:
-                escaped = False
-            elif char == "\\":
-                escaped = True
-            elif char == '"':
-                in_string = False
+    decoder = json.JSONDecoder(strict=False)
+    index = 0
+    length = len(text)
+    while index < length:
+        brace = text.find("{", index)
+        if brace == -1:
+            return
+        try:
+            obj, end = decoder.raw_decode(text, brace)
+        except json.JSONDecodeError:
+            index = brace + 1
             continue
-        if char == '"':
-            in_string = True
-        elif char == "{":
-            if depth == 0:
-                start = index
-            depth += 1
-        elif char == "}":
-            if depth > 0:
-                depth -= 1
-                if depth == 0 and start != -1:
-                    yield text[start : index + 1]
+        index = end
+        yield obj
 
 
 def save_report_from_text(report_text: str, output_dir: str, run_id: str) -> str | None:
     """Extract the JSON object from reporter output and write ``{run_id}.json``."""
     report_data = None
-    for candidate in _iter_json_candidates(report_text):
-        try:
-            parsed = json.loads(candidate)
-        except json.JSONDecodeError:
+    fallback = None
+    for parsed in _iter_json_objects(report_text):
+        if not isinstance(parsed, dict):
             continue
-        # The report is an object with findings; skip illustrative fragments.
-        if isinstance(parsed, dict) and "findings" in parsed:
+        # The report is an object carrying a findings list. Reporters sometimes
+        # print a partial attempt, then re-emit the whole report below, so the
+        # LAST such object wins rather than the first.
+        if isinstance(parsed.get("findings"), list):
             report_data = parsed
-            break
-        if isinstance(parsed, dict) and report_data is None:
-            report_data = parsed
+        elif fallback is None:
+            fallback = parsed
+    if report_data is None:
+        report_data = fallback
 
     if report_data is None:
         os.makedirs(output_dir, exist_ok=True)
