@@ -1,0 +1,15 @@
+# Environment
+.env
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Report artifacts
+outputs/
+/*.json
+
+# OS
+.DS_Store
