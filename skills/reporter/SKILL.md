@@ -28,7 +28,28 @@ Format the following analyst output into the final report:
 3. Validate severity classifications against `references/severity-and-cwe.md`
    and confirm each CWE mapping.
 4. Produce complete evidence with code snippets and taint flows.
-5. Emit the final JSON in the schema below.
+5. Write **reproduction steps** and a concrete **remediation** for each finding
+   (see the rules below). A finding a developer cannot reproduce or fix is not
+   actionable.
+6. Emit the final JSON in the schema below.
+
+## Reproduction and remediation
+
+Every finding must be actionable, not just described:
+
+- `reproduction_steps` — an ordered list of concrete steps a developer can
+  follow to observe the issue: the request to send, the input to supply, the
+  code path that executes, and what to look for. Reference exact files and
+  lines. Where an HTTP request or CLI command makes it concrete, include it.
+- `remediation.summary` — one sentence naming the fix.
+- `remediation.fix` — the specific change to make, in prose, tied to the exact
+  file(s) and line(s) in the evidence. Prescribe the secure pattern; do not just
+  restate the problem.
+- `remediation.code_example` — a minimal corrected code snippet (raw code, no
+  markdown fences) showing the secure version. Omit only when a code change is
+  genuinely not the fix (e.g. a deployment/config control), and say so in `fix`.
+- `remediation.references` — a list of authoritative URLs (the relevant CWE
+  page, OWASP cheat sheet, or framework security docs). At least one.
 
 ## Evidence and taint flow
 
@@ -64,6 +85,17 @@ Emit a single JSON object in exactly this schema. Ensure it is valid JSON.
             "cwe_id": "CWE-<number>",
             "severity": "<critical|high|medium|low|informational>",
             "confidence": "<high|medium|low>",
+            "reproduction_steps": [
+                "<step 1: concrete action, exact file/line or request>",
+                "<step 2>",
+                "<step 3: what to observe>"
+            ],
+            "remediation": {
+                "summary": "<one-sentence fix>",
+                "fix": "<specific change tied to the exact file(s)/line(s)>",
+                "code_example": "<raw corrected code, no markdown fences>",
+                "references": ["https://cwe.mitre.org/...", "https://owasp.org/..."]
+            },
             "taint_analysis": {
                 "source_location": "<file:line>",
                 "sink_location": "<file:line>",

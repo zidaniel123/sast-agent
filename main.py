@@ -32,6 +32,7 @@ from loguru import logger
 
 from config import Settings, assert_mcp_tools_allowed, mcp_servers
 from fingerprint import deduplicate
+from report_markdown import render_markdown
 from skills import load_skill, reference_appendix, specialist
 
 try:  # Present on current SDKs; absent on older ones.
@@ -285,8 +286,17 @@ def save_report_from_text(report_text: str, output_dir: str, run_id: str) -> str
     with open(report_path, "w", encoding="utf-8") as report_file:
         json.dump(report_data, report_file, indent=2)
 
+    # The human-facing Markdown report is best-effort: a rendering problem must
+    # not lose the JSON that already wrote successfully above.
+    markdown_path = os.path.join(output_dir, f"{run_id}.md")
+    try:
+        with open(markdown_path, "w", encoding="utf-8") as markdown_file:
+            markdown_file.write(render_markdown(report_data))
+    except Exception as exc:  # noqa: BLE001 — never fail the run over the report view
+        logger.warning(f"Could not render Markdown report: {exc}")
+
     finding_count = len(report_data.get("findings", []))
-    logger.success(f"Report written to {report_path} ({finding_count} findings)")
+    logger.success(f"Report written to {report_path} and {markdown_path} ({finding_count} findings)")
     return report_path
 
 
