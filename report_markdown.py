@@ -75,6 +75,9 @@ def _finding_section(index: int, finding: dict[str, Any]) -> list[str]:
     dupes = finding.get("duplicate_count")
     if isinstance(dupes, int) and dupes > 1:
         meta.append(f"- **Occurrences merged:** {dupes}")
+    scanner = finding.get("scanner_evidence")
+    if isinstance(scanner, dict) and _str(scanner.get("rule_id")):
+        meta.append(f"- **Scanner-grounded:** semgrep `{_str(scanner.get('rule_id'))}`")
     lines.extend(meta)
     lines.append("")
 

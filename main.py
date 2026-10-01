@@ -1,13 +1,17 @@
 """Autonomous SAST pipeline built on the Claude Agent SDK.
 
-Runs three specialist agents in sequence over a local codebase:
+Runs a deterministic pre-scan followed by three specialist agents in sequence
+over a local codebase:
 
+    semgrep  -> deterministic candidate findings (semgrep_scan.py, no LLM)
     recon    -> map the attack surface (ast-grep + xray)
     analyst  -> deep vulnerability + taint analysis (ast-grep + xray)
     reporter -> emit a structured JSON findings report
 
-Each phase loads its system prompt from a ``SKILL.md`` file (see ``skills/``)
-and shares one MCP server definition (see ``config.py``).
+Each LLM phase loads its system prompt from a ``SKILL.md`` file (see
+``skills/``) and shares one MCP server definition (see ``config.py``). Phase 0
+runs here in the orchestration layer, never as an agent tool — the specialists
+are deliberately denied Bash, and that boundary stays intact.
 """
 
 from __future__ import annotations
@@ -33,6 +37,13 @@ from loguru import logger
 from config import Settings, assert_mcp_tools_allowed, mcp_servers
 from fingerprint import deduplicate
 from report_markdown import render_markdown
+from semgrep_scan import (
+    ScanOutcome,
+    SemgrepConfig,
+    SemgrepUnavailableError,
+    render_candidates_block,
+    run_scan,
+)
 from skills import load_skill, reference_appendix, specialist
 
 try:  # Present on current SDKs; absent on older ones.
@@ -176,12 +187,18 @@ async def recon_activity(settings: Settings, code_path: str) -> str:
     )
 
 
-async def analyst_activity(settings: Settings, code_path: str, recon_context: str) -> str:
+async def analyst_activity(
+    settings: Settings,
+    code_path: str,
+    recon_context: str,
+    semgrep_candidates: str,
+) -> str:
     """Security analyst: deep vulnerability + taint analysis."""
     system_prompt = _phase_prompt(
         "analyst",
         code_path=code_path,
         recon_context=recon_context,
+        semgrep_candidates=semgrep_candidates,
     )
     return await _run_phase(
         "ANALYST",
@@ -242,8 +259,18 @@ def _iter_json_objects(text: str) -> Iterator[Any]:
         yield obj
 
 
-def save_report_from_text(report_text: str, output_dir: str, run_id: str) -> str | None:
-    """Extract the JSON object from reporter output and write ``{run_id}.json``."""
+def save_report_from_text(
+    report_text: str,
+    output_dir: str,
+    run_id: str,
+    semgrep: dict[str, Any] | None = None,
+) -> str | None:
+    """Extract the JSON object from reporter output and write ``{run_id}.json``.
+
+    ``semgrep`` is the Phase 0 outcome metadata (see ``ScanOutcome.metadata``);
+    when given, it is merged into ``report_metadata`` here, in code, so scanner
+    provenance is recorded deterministically rather than left to the model.
+    """
     report_data = None
     fallback = None
     for parsed in _iter_json_objects(report_text):
@@ -269,6 +296,13 @@ def save_report_from_text(report_text: str, output_dir: str, run_id: str) -> str
             f"Raw output preserved at {raw_path} so the run is not lost."
         )
         return None
+
+    if semgrep is not None:
+        metadata = report_data.get("report_metadata")
+        if not isinstance(metadata, dict):
+            metadata = {}
+            report_data["report_metadata"] = metadata
+        metadata["semgrep"] = semgrep
 
     # Deduplication happens here, in code, after the model is done. The model
     # decides what it found; this assigns each finding a fingerprint that is
@@ -305,21 +339,29 @@ async def run_sast_analysis(
     output_dir: str,
     run_id: str,
     settings: Settings,
+    semgrep_config: SemgrepConfig | None = None,
 ) -> str | None:
-    """Run the full three-phase SAST pipeline over ``code_path``."""
+    """Run the full pipeline over ``code_path``: Phase 0 scan, then recon → analyst → reporter."""
     logger.info("STARTING multi-pass source code analysis")
+
+    # Phase 0 is synchronous subprocess work; to_thread keeps the event loop
+    # free even though nothing else is scheduled yet.
+    logger.info("Phase 0: deterministic Semgrep pre-scan ...")
+    semgrep_config = semgrep_config or SemgrepConfig.from_env()
+    scan: ScanOutcome = await asyncio.to_thread(run_scan, code_path, semgrep_config)
+    semgrep_candidates = render_candidates_block(scan)
 
     logger.info("Phase 1: reconnaissance ...")
     recon_context = await recon_activity(settings, code_path)
     logger.info(f"Reconnaissance completed. Context length: {len(recon_context)} characters")
 
     logger.info("Phase 2: security analysis with reconnaissance context ...")
-    analysis_results = await analyst_activity(settings, code_path, recon_context)
+    analysis_results = await analyst_activity(settings, code_path, recon_context, semgrep_candidates)
     logger.info(f"Security analysis completed. Results length: {len(analysis_results)} characters")
 
     logger.info("Phase 3: final report generation ...")
     report_results = await reporter_activity(settings, code_path, analysis_results)
-    report_path = save_report_from_text(report_results, output_dir, run_id)
+    report_path = save_report_from_text(report_results, output_dir, run_id, semgrep=scan.metadata())
     logger.info("Final reporting completed")
     return report_path
 
@@ -364,6 +406,11 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", default="outputs", help="Directory for the JSON report (default: outputs/).")
     parser.add_argument("--model", default=None, help="Override the LLM model id (gateway-specific).")
     parser.add_argument("--run-id", default=None, help="Optional run id (defaults to a random UUID).")
+    parser.add_argument(
+        "--no-semgrep",
+        action="store_true",
+        help="Skip the Phase 0 deterministic Semgrep pre-scan (same as SAST_NO_SEMGREP=1).",
+    )
     return parser.parse_args()
 
 
@@ -387,6 +434,7 @@ def main() -> None:
 
     output_dir = os.path.abspath(os.path.expanduser(args.output_dir))
     settings = Settings.from_env(model=args.model)
+    semgrep_config = SemgrepConfig.from_env(disabled=args.no_semgrep)
     if not settings.api_key:
         raise SystemExit(
             "No API key found. Set REQUESTY_API_KEY, OPENAI_API_KEY, or "
@@ -398,9 +446,16 @@ def main() -> None:
     logger.info(f"Codebase: {code_path}")
 
     try:
-        report_path = asyncio.run(run_sast_analysis(code_path, output_dir, run_id, settings))
+        report_path = asyncio.run(
+            run_sast_analysis(code_path, output_dir, run_id, settings, semgrep_config)
+        )
     except PhaseError as exc:
         raise SystemExit(f"Analysis aborted: {exc}") from exc
+    except SemgrepUnavailableError as exc:
+        # Fail fast, like the other startup gates: silently dropping Phase 0
+        # would produce a report with no deterministic grounding while looking
+        # exactly like one that had it.
+        raise SystemExit(str(exc)) from exc
 
     _print_summary(report_path, run_id)
     if report_path is None:

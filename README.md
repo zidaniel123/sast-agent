@@ -4,9 +4,13 @@ An autonomous static application security testing (SAST) agent that reviews a
 codebase you have access to and emits a structured JSON findings report. Built
 on the [Claude Agent SDK](https://github.com/anthropics/claude-agent-sdk-python).
 
-Three specialist agents run in sequence — **recon → analyst → reporter** — each
+A deterministic **Semgrep pre-scan (Phase 0)** runs first, in plain Python —
+no LLM involved — and its candidate findings are handed to three specialist
+agents that run in sequence: **recon → analyst → reporter**. Each specialist is
 driven by an editable `SKILL.md` playbook, each with read-only access to the
-code and two structural-analysis MCP servers.
+code and two structural-analysis MCP servers. The analyst's job on scanner
+candidates is prove-or-refute with taint evidence, then to hunt for what a
+pattern matcher cannot see.
 
 ![SAST agent architecture](docs/architecture.png)
 
@@ -18,13 +22,15 @@ code and two structural-analysis MCP servers.
 flowchart TD
     A["<b>Start</b><br/>uv run python main.py --path CODE"] --> B["Settings.from_env()<br/>gateway key, base URL, model<br/>fail fast if no key"]
     B --> C["assert_mcp_tools_allowed()<br/>every configured MCP server must<br/>appear in APPROVED_TOOLS"]
-    C --> D["Launch MCP servers over stdio<br/>ast-grep + xray via uvx<br/>strict_mcp_config, setting_sources=[]"]
+    C --> P0["<b>Phase 0 — SEMGREP</b> (semgrep_scan.py)<br/>local binary, else docker run semgrep/semgrep<br/>no LLM, no agent — plain subprocess"]
+    P0 -->|"candidate findings<br/>rule id · severity · path · line · CWE"| P0B["Compact JSON block rendered<br/>for the analyst prompt"]
+    P0B --> D["Launch MCP servers over stdio<br/>ast-grep + xray via uvx<br/>strict_mcp_config, setting_sources=[]"]
 
     D --> E["<b>Phase 1 — RECON</b><br/>prompt = skills/recon/SKILL.md<br/>+ references/ast-grep-and-xray.md"]
     E -->|"Read · Grep · Glob<br/>mcp__ast-grep · mcp__xray"| F["Attack-surface inventory<br/>stack, auth, entry points, sinks"]
 
-    F --> G["<b>Phase 2 — ANALYST</b><br/>prompt = skills/analyst/SKILL.md<br/>+ 3 references + recon output"]
-    G -->|"structural match, then<br/>taint trace source → sink"| H["Candidate findings<br/>with data-flow paths"]
+    F --> G["<b>Phase 2 — ANALYST</b><br/>prompt = skills/analyst/SKILL.md<br/>+ 3 references + recon output<br/>+ semgrep candidates"]
+    G -->|"prove-or-refute each candidate<br/>with taint evidence, then hunt<br/>what the scanner cannot see"| H["Candidate findings<br/>with data-flow paths<br/>+ refuted-candidate list"]
 
     H --> I["<b>Phase 3 — REPORTER</b><br/>prompt = skills/reporter/SKILL.md<br/>+ 2 references + analyst output"]
     I --> J["Extract JSON<br/>fenced block, then brace-depth scan"]
@@ -32,8 +38,10 @@ flowchart TD
     J --> K{"Parseable?"}
     K -->|no| L["Write RUNID.raw.txt<br/>exit 1 — the run is recoverable"]
     K -->|yes| M["<b>Deduplicate</b> (fingerprint.py)<br/>stable id per finding<br/>merge collisions, union evidence"]
-    M --> N["<b>End</b><br/>outputs/RUNID.json + console summary"]
+    M --> M2["Merge Phase 0 metadata into<br/>report_metadata.semgrep (in code,<br/>not by the model)"]
+    M2 --> N["<b>End</b><br/>outputs/RUNID.json + console summary"]
 
+    P0 -.->|"no semgrep binary AND no docker<br/>and not opted out"| X0["SemgrepUnavailableError → exit 1<br/>install it, or pass --no-semgrep"]
     E -.->|"phase error, max_turns,<br/>or empty output"| X["PhaseError → exit 1"]
     G -.-> X
     I -.-> X
@@ -42,6 +50,51 @@ flowchart TD
 Every phase boundary is a hard gate: a phase that hits its turn budget, returns
 an API error, or produces nothing raises `PhaseError` and stops the run. Earlier
 versions passed partial output forward and still emitted a clean-looking report.
+
+---
+
+## Phase 0: deterministic grounding
+
+Before any model sees the code, [`semgrep_scan.py`](semgrep_scan.py) runs
+[Semgrep](https://semgrep.dev) as a plain subprocess and parses the `--json`
+output into a compact candidate list — rule id, severity, path, line, snippet,
+and CWE where the rule metadata carries one. That list is injected into the
+analyst's prompt, so its job on those candidates is **prove-or-refute with taint
+evidence**: confirmed candidates become findings marked with `scanner_evidence`
+(the Semgrep rule id), refuted ones are recorded with a reason, and the analyst
+still hunts for the classes a pattern matcher cannot see — business logic,
+authorization, multi-file flows.
+
+Why the scanner lives in the orchestration layer and not as an agent tool: the
+specialists are deliberately denied `Bash` (see [Security model](#security-model)),
+and that boundary does not move for convenience. The model never decides whether
+the scan happens; it only judges what the scan found.
+
+**Invocation modes, in priority order:**
+
+1. A local `semgrep` binary on `PATH`.
+2. `docker run semgrep/semgrep` — the codebase is mounted at `/src` **read-only**.
+3. Neither present → the run aborts with a startup error naming the install
+   options. Silently falling back to ungrounded analysis while looking like a
+   grounded run is exactly what Phase 0 exists to prevent, so it fails fast.
+
+A scan that *starts* and then fails (timeout, crash, unparseable output) is the
+one exception: it degrades to a loud warning and the analyst is told in words
+that it has no deterministic leads, so one Semgrep crash cannot destroy an
+otherwise-good three-phase run.
+
+**Phase 0 configuration** (all optional):
+
+| Variable / flag | Default | Description |
+| --- | --- | --- |
+| `--no-semgrep` / `SAST_NO_SEMGREP=1` | off | Skip Phase 0 entirely, with a loud warning; the analyst is told it has no leads. |
+| `SEMGREP_CONFIG` | `auto` | Semgrep ruleset. `auto` pulls from the Semgrep registry and needs network access; set a local ruleset path or `p/<pack>` to control this. |
+| `SEMGREP_TIMEOUT` | `600` | Wall-clock seconds for the whole scan. |
+| `SEMGREP_IMAGE` | `semgrep/semgrep:latest` | Docker image for the fallback mode. Pin it to a tag or digest to freeze the scanner — the lockfile argument, applied to the scanner. |
+
+Metrics are disabled (`--metrics=off`) so the CLI does not phone scan metadata
+home to semgrep.dev. Candidates are capped at 200 per run, highest severity
+first, and the analyst is told when truncation happened.
 
 ---
 
@@ -183,6 +236,9 @@ accepted this last week." That needs a small on-disk store and is not built yet.
 - **An LLM gateway and API key.** The SDK speaks the **Anthropic Messages API**,
   so the endpoint must be Anthropic-compatible (a Requesty-style router is the
   default). An OpenAI-only endpoint will not work.
+- **Semgrep** on `PATH` (`brew install semgrep` / `pipx install semgrep`), or
+  **Docker** so Phase 0 can run `semgrep/semgrep` in a container. Without one
+  of these the run aborts at startup unless you opt out with `--no-semgrep`.
 
 ## Install
 
@@ -228,6 +284,7 @@ uv run python main.py --path /path/to/your/codebase
 | `--output-dir` | `outputs/` | Where the JSON report is written. |
 | `--model` | env / default | Override the LLM model id for this run. |
 | `--run-id` | random UUID | Custom run id, also the report filename. Restricted to `[A-Za-z0-9_.-]{1,64}`. |
+| `--no-semgrep` | off | Skip the Phase 0 Semgrep pre-scan (same as `SAST_NO_SEMGREP=1`). |
 
 Exit status is meaningful: **0** only when a report was written, **1** when a
 phase failed or no parseable report was produced.
@@ -296,6 +353,12 @@ worth knowing about:
    the moment of the run. Set `AST_GREP_MCP_REF` / `XRAY_MCP_REF` to a tag or
    commit SHA to freeze them — the lockfile argument, applied to tool servers.
 2. **The `claude` CLI**, which the SDK spawns as a subprocess.
+3. **The Phase 0 scanner.** Semgrep is executed on your host (directly or via a
+   `semgrep/semgrep` container), and with the default `SEMGREP_CONFIG=auto` it
+   downloads rules from the Semgrep registry on every run. Pin `SEMGREP_IMAGE`
+   to a digest and/or point `SEMGREP_CONFIG` at a vendored ruleset to freeze
+   both halves of that. Metrics are disabled (`--metrics=off`), but the ruleset
+   fetch itself is network traffic about *when* you scan.
 
 CI pins every GitHub Action to a commit SHA rather than a moving tag, for the
 same reason.
@@ -307,7 +370,11 @@ same reason.
 A single JSON object: `report_metadata` plus a `findings[]` array. Each finding
 carries a `finding_id` (the fingerprint above), `duplicate_count`, the
 vulnerability, `cwe_id`, `severity`, `confidence`, a `taint_analysis` object, and
-`evidences[]` with code snippets and the source-to-sink flow.
+`evidences[]` with code snippets and the source-to-sink flow. Findings that
+confirm a Phase 0 candidate additionally carry `scanner_evidence` with the
+Semgrep `rule_id`. `report_metadata.semgrep` records the Phase 0 outcome
+(status, version, candidate count, rules triggered) — merged in by Python after
+the model is done, so scanner provenance is deterministic, not remembered.
 
 ```json
 {
@@ -315,7 +382,16 @@ vulnerability, `cwe_id`, `severity`, `confidence`, a `taint_analysis` object, an
     "codebase_path": "/path/to/your/codebase",
     "report_timestamp": "2026-08-03T12:00:00+00:00",
     "analysis_source": "security_analyst_agent",
-    "report_generator": "final_reporter_agent"
+    "report_generator": "final_reporter_agent",
+    "semgrep": {
+      "status": "ok",
+      "version": "1.95.0",
+      "config": "auto",
+      "candidate_count": 7,
+      "rules_triggered": 5,
+      "truncated": false,
+      "detail": null
+    }
   },
   "findings": [
     {
@@ -326,6 +402,11 @@ vulnerability, `cwe_id`, `severity`, `confidence`, a `taint_analysis` object, an
       "cwe_id": "CWE-89",
       "severity": "high",
       "confidence": "high",
+      "scanner_evidence": {
+        "rule_id": "python.lang.security.audit.formatted-sql-query.formatted-sql-query",
+        "path": "app/db/queries.py",
+        "line": 58
+      },
       "taint_analysis": {
         "source_location": "app/api/users.py:31",
         "sink_location": "app/db/queries.py:58",
@@ -360,7 +441,8 @@ Behavior lives in editable Markdown, not Python:
 
 - **`skills/{recon,analyst,reporter}/SKILL.md`** — each phase's system prompt,
   with YAML frontmatter and a Markdown body. `{{code_path}}`, `{{recon_context}}`,
-  `{{analysis_results}}` and `{{references}}` are substituted at render time.
+  `{{semgrep_candidates}}`, `{{analysis_results}}` and `{{references}}` are
+  substituted at render time.
 - **`references/`** — the specs the skills cite:
   [`taint-analysis.md`](references/taint-analysis.md) (flow + PoC format),
   [`severity-and-cwe.md`](references/severity-and-cwe.md) (severity rubric),
@@ -404,9 +486,11 @@ it or interacts with a running system. See [`SECURITY.md`](SECURITY.md).
 uv run pytest
 ```
 
-83 tests, no network and no API key required — config resolution, the gateway URL
+136 tests, no network and no API key required — config resolution, the gateway URL
 normalizer, the MCP allowlist guard, path-escape guards, prompt rendering, JSON
-extraction from messy model output, and fingerprint stability.
+extraction from messy model output, fingerprint stability, and the Phase 0
+Semgrep scan (subprocess and PATH lookups are mocked, so the suite runs on a
+machine with neither Semgrep nor Docker installed).
 
 ---
 
@@ -414,12 +498,13 @@ extraction from messy model output, and fingerprint stability.
 
 - Findings are LLM-generated and **require human validation**. Expect false
   positives and misses.
-- **There is no deterministic evidence gate.** Nothing verifies that a reported
-  finding corresponds to a real scanner hit — the analyst's output becomes the
-  reporter's input becomes the report. Grounding candidate findings in a
-  deterministic analyzer first (Semgrep SARIF, say) and reducing the analyst's
-  job to prove-or-refute is the most valuable change this repo could make, and it
-  has not been made yet.
+- **Scanner grounding is a floor, not a ceiling.** Phase 0 gives the analyst
+  deterministic Semgrep candidates to prove-or-refute, and confirmed findings
+  are marked with `scanner_evidence`. But a scanner hit is not a verdict — the
+  analyst's confirmation is itself a judgement call — and a clean Phase 0 says
+  nothing about business logic, authorization, or multi-file flows. A report
+  where `report_metadata.semgrep.status` is `disabled` or `failed` had no
+  deterministic leads at all; read it accordingly.
 - Severity and confidence are judgement calls; check them against your own threat
   model.
 - Quality depends on the model, the codebase size, and the per-phase turn budgets.

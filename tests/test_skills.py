@@ -76,7 +76,10 @@ class TestRenderedPrompts:
 
         prompts = {
             "recon": _phase_prompt("recon", code_path="/tmp/x"),
-            "analyst": _phase_prompt("analyst", code_path="/tmp/x", recon_context="ctx"),
+            "analyst": _phase_prompt(
+                "analyst", code_path="/tmp/x", recon_context="ctx",
+                semgrep_candidates="(no leads)",
+            ),
             "reporter": _phase_prompt(
                 "reporter",
                 code_path="/tmp/x",
@@ -90,7 +93,10 @@ class TestRenderedPrompts:
     def test_every_cited_reference_is_actually_inlined(self):
         from main import _phase_prompt
 
-        prompt = _phase_prompt("analyst", code_path="/tmp/x", recon_context="ctx")
+        prompt = _phase_prompt(
+            "analyst", code_path="/tmp/x", recon_context="ctx",
+            semgrep_candidates="(no leads)",
+        )
         for name in specialist("analyst").references:
             body = load_reference(name).strip()
             # A distinctive line from each spec must survive into the prompt.
