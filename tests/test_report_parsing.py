@@ -116,6 +116,33 @@ class TestFailureIsRecoverable:
         assert _write(tmp_path, "{ this is not json at all ") is None
 
 
+class TestSemgrepMetadata:
+    """Phase 0 provenance is merged into report_metadata in code, not by the model."""
+
+    SEMGREP = {"status": "ok", "version": "1.95.0", "config": "auto",
+               "candidate_count": 3, "rules_triggered": 2, "truncated": False,
+               "detail": None}
+
+    def test_semgrep_block_is_merged_into_existing_metadata(self, tmp_path):
+        path = save_report_from_text(json.dumps(REPORT), str(tmp_path), "run1",
+                                     semgrep=self.SEMGREP)
+        written = json.loads(open(path).read())
+        assert written["report_metadata"]["semgrep"] == self.SEMGREP
+        # The model's own metadata survives the merge.
+        assert written["report_metadata"]["codebase_path"] == "/tmp/x"
+
+    def test_semgrep_block_creates_metadata_when_the_model_omitted_it(self, tmp_path):
+        report = {"findings": [{"vulnerability": "x"}]}
+        path = save_report_from_text(json.dumps(report), str(tmp_path), "run1",
+                                     semgrep=self.SEMGREP)
+        written = json.loads(open(path).read())
+        assert written["report_metadata"]["semgrep"]["status"] == "ok"
+
+    def test_no_semgrep_argument_leaves_the_report_untouched(self, tmp_path):
+        path = _write(tmp_path, json.dumps(REPORT))
+        assert "semgrep" not in json.loads(open(path).read())["report_metadata"]
+
+
 class TestRunIdValidation:
     @pytest.mark.parametrize("good", ["run1", "2026-01-01_scan", "a.b-c_d", "x" * 64])
     def test_accepts_safe_ids(self, good):

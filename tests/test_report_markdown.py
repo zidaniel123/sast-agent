@@ -67,6 +67,26 @@ class TestRender:
         assert "| critical | 1 |" in md
         assert "| low | 1 |" in md
 
+    def test_scanner_grounded_findings_are_marked(self):
+        report = {
+            "findings": [
+                {
+                    "vulnerability": "Command injection",
+                    "severity": "high",
+                    "scanner_evidence": {
+                        "rule_id": "python.lang.security.audit.subprocess-shell-true",
+                        "path": "run.py",
+                        "line": 12,
+                    },
+                },
+                {"vulnerability": "Broken authz", "severity": "high"},
+            ]
+        }
+        md = render_markdown(report)
+        assert "`python.lang.security.audit.subprocess-shell-true`" in md
+        # The model-discovered finding carries no scanner marking.
+        assert "Broken authz" in md.split("Scanner-grounded", 1)[1]
+
 
 class TestDegradesGracefully:
     def test_empty_report(self):

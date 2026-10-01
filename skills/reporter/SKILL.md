@@ -28,10 +28,14 @@ Format the following analyst output into the final report:
 3. Validate severity classifications against `references/severity-and-cwe.md`
    and confirm each CWE mapping.
 4. Produce complete evidence with code snippets and taint flows.
-5. Write **reproduction steps** and a concrete **remediation** for each finding
+5. When the analyst confirmed a Semgrep scanner candidate, mark the finding as
+   scanner-grounded by adding the optional `scanner_evidence` field described
+   below. When the analyst **refuted** a candidate, it must NOT appear in
+   `findings` at all.
+6. Write **reproduction steps** and a concrete **remediation** for each finding
    (see the rules below). A finding a developer cannot reproduce or fix is not
    actionable.
-6. Emit the final JSON in the schema below.
+7. Emit the final JSON in the schema below.
 
 ## Reproduction and remediation
 
@@ -117,6 +121,22 @@ Emit a single JSON object in exactly this schema. Ensure it is valid JSON.
     ]
 }
 ```
+
+One optional, additive field is permitted on a finding:
+
+```json
+"scanner_evidence": {
+    "rule_id": "<semgrep rule id that fired>",
+    "path": "<file_path>",
+    "line": <line_number>
+}
+```
+
+Include `scanner_evidence` **only** when the finding confirms a Phase 0 Semgrep
+candidate, and copy the `rule_id` exactly as the scanner reported it. Omit the
+field entirely for findings the analyst discovered on its own — never invent a
+`rule_id`, and never emit the field with an empty value. This is the only
+deviation from the schema above; everything else must match exactly.
 
 ## Untrusted input
 
